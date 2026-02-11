@@ -138,8 +138,41 @@ function(make_torchcodec_libraries
         Metadata.cpp
     )
 
+    if(ENABLE_CUDA AND ENABLE_ROCM)
+        message(FATAL_ERROR "Cannot enable both CUDA and ROCM simultaneously. Set only one of ENABLE_CUDA or ENABLE_ROCM.")
+    endif()
+
     if(ENABLE_CUDA)
 	    list(APPEND core_sources CudaDeviceInterface.cpp BetaCudaDeviceInterface.cpp NVDECCache.cpp CUDACommon.cpp NVCUVIDRuntimeLoader.cpp)
+    endif()
+
+    if(ENABLE_ROCM)
+        # Find HIP package - required for ROCm builds
+        # On ROCm PyTorch, HIP is available through the torch installation
+        if(NOT DEFINED ROCM_PATH)
+            if(DEFINED ENV{ROCM_PATH})
+                set(ROCM_PATH "$ENV{ROCM_PATH}")
+            else()
+                set(ROCM_PATH "/opt/rocm")
+            endif()
+        endif()
+        list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}")
+        find_package(hip QUIET)
+
+        # C++ source files that don't contain HIP kernels
+        set(ROCM_CPP_SOURCES
+            RocDecodeDeviceInterface.cpp
+            RocDecodeCache.cpp
+            HIPCommon.cpp
+            RocDecodeRuntimeLoader.cpp
+        )
+        list(APPEND core_sources ${ROCM_CPP_SOURCES})
+
+        # HIPColorspaceKernels.cpp contains __global__ HIP kernels and must
+        # be compiled with the ROCm Clang compiler with -x hip flag.
+        # We set ROCM_HIP_KERNEL_SOURCE so it can be linked in later.
+        set(ROCM_HIP_KERNEL_SOURCE
+            "${CMAKE_CURRENT_SOURCE_DIR}/HIPColorspaceKernels.cpp")
     endif()
 
     set(core_library_dependencies
@@ -154,12 +187,80 @@ function(make_torchcodec_libraries
         )
     endif()
 
+    if(ENABLE_ROCM)
+        if(hip_FOUND)
+            list(APPEND core_library_dependencies hip::host)
+        endif()
+    endif()
+
     make_torchcodec_sublibrary(
         "${core_library_name}"
         SHARED
         "${core_sources}"
         "${core_library_dependencies}"
     )
+
+    if(ENABLE_ROCM)
+        # Add HIP include dirs to core library for all ROCm .cpp files
+        target_include_directories(${core_library_name}
+            PRIVATE
+            "${ROCM_PATH}/include"
+        )
+
+        # Compile HIP kernel file with ROCm Clang and link it into the core library.
+        # We use add_custom_command because the kernel file needs -x hip and
+        # specific GPU architecture flags that are incompatible with the system
+        # C++ compiler (gcc).
+        set(HIP_KERNEL_OBJ "${CMAKE_CURRENT_BINARY_DIR}/HIPColorspaceKernels.o")
+        set(HIP_CLANG "${ROCM_PATH}/lib/llvm/bin/clang++")
+
+        # GPU architectures for HIP kernel compilation.
+        # Override with -DHIP_ARCHITECTURES="gfx942;gfx90a" to limit targets.
+        # The default list covers datacenter + consumer GPUs across generations:
+        #   gfx90a  = MI250/MI250X (CDNA2)
+        #   gfx942  = MI300X/MI300A/MI325X (CDNA3)
+        #   gfx950  = MI355X (CDNA4)
+        #   gfx1100 = RX 7900 XTX (RDNA3)
+        #   gfx1200 = RX 9070 (RDNA4)
+        # Adding an arch that the installed ROCm doesn't support is harmless -
+        # the compiler will warn but the other targets still build.
+        if(NOT DEFINED HIP_ARCHITECTURES)
+            set(HIP_ARCHITECTURES "gfx90a;gfx942;gfx950;gfx1100;gfx1200")
+        endif()
+
+        # Build the --offload-arch flags
+        set(HIP_ARCH_FLAGS "")
+        foreach(arch ${HIP_ARCHITECTURES})
+            list(APPEND HIP_ARCH_FLAGS "--offload-arch=${arch}")
+        endforeach()
+
+        add_custom_command(
+            OUTPUT ${HIP_KERNEL_OBJ}
+            COMMAND ${HIP_CLANG}
+                -x hip
+                -c ${ROCM_HIP_KERNEL_SOURCE}
+                -o ${HIP_KERNEL_OBJ}
+                ${HIP_ARCH_FLAGS}
+                -fPIC
+                -std=c++17
+                -O2
+                -I${ROCM_PATH}/include
+                -I${CMAKE_CURRENT_SOURCE_DIR}
+                -I${CMAKE_CURRENT_SOURCE_DIR}/../../../
+                -I${TORCH_INSTALL_PREFIX}/include
+                -I${TORCH_INSTALL_PREFIX}/include/torch/csrc/api/include
+                -D__HIP_PLATFORM_AMD__
+            DEPENDS ${ROCM_HIP_KERNEL_SOURCE}
+            COMMENT "Compiling HIP kernels: HIPColorspaceKernels.cpp"
+        )
+        add_custom_target(hip_kernels_${ffmpeg_major_version} DEPENDS ${HIP_KERNEL_OBJ})
+        add_dependencies(${core_library_name} hip_kernels_${ffmpeg_major_version})
+        target_link_libraries(${core_library_name} PUBLIC ${HIP_KERNEL_OBJ})
+        # Link against amdhip64 for HIP runtime - use PRIVATE to avoid
+        # forcing transitive load of the HIP runtime which needs /dev/kfd.
+        # The HIP runtime is loaded lazily when actual GPU operations occur.
+        target_link_libraries(${core_library_name} PRIVATE "${ROCM_PATH}/lib/libamdhip64.so")
+    endif()
 
     # 2. Create libtorchcodec_custom_opsN.{ext}.
     set(custom_ops_library_name "libtorchcodec_custom_ops${ffmpeg_major_version}")

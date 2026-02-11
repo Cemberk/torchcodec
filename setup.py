@@ -112,6 +112,13 @@ class CMakeBuild(build_ext):
         torch_dir = Path(torch.utils.cmake_prefix_path) / "Torch"
         cmake_build_type = os.environ.get("CMAKE_BUILD_TYPE", "Release")
         enable_cuda = os.environ.get("ENABLE_CUDA", "")
+        enable_rocm = os.environ.get("ENABLE_ROCM", "")
+
+        # Auto-detect ROCm if torch was built with HIP and neither flag is set
+        if not enable_cuda and not enable_rocm:
+            if hasattr(torch.version, "hip") and torch.version.hip is not None:
+                enable_rocm = "ON"
+
         torchcodec_disable_compile_warning_as_error = os.environ.get(
             "TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR", "OFF"
         )
@@ -126,9 +133,37 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={cmake_build_type}",
             f"-DPYTHON_VERSION={python_version.major}.{python_version.minor}",
             f"-DENABLE_CUDA={enable_cuda}",
+            f"-DENABLE_ROCM={enable_rocm}",
             f"-DTORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR={torchcodec_disable_compile_warning_as_error}",
             f"-DTORCHCODEC_DISABLE_HOMEBREW_RPATH={torchcodec_disable_homebrew_rpath}",
         ]
+
+        # For ROCm builds, set the HIP compiler to the ROCm Clang
+        # CMake >= 4.0 requires the actual Clang compiler, not the hipcc wrapper
+        if enable_rocm:
+            rocm_path = os.environ.get("ROCM_PATH", "/opt/rocm")
+            rocm_clang = os.path.join(rocm_path, "lib", "llvm", "bin", "clang++")
+            if os.path.exists(rocm_clang):
+                cmake_args.append(f"-DCMAKE_HIP_COMPILER={rocm_clang}")
+            cmake_args.append(f"-DCMAKE_PREFIX_PATH={rocm_path}")
+
+            # Allow user to specify target GPU architectures via env var.
+            # e.g. HIP_ARCHITECTURES="gfx942;gfx90a" for MI300X + MI250 only.
+            # If not set, CMakeLists.txt uses a broad default list.
+            hip_archs = os.environ.get("HIP_ARCHITECTURES", "")
+            if hip_archs:
+                cmake_args.append(f"-DHIP_ARCHITECTURES={hip_archs}")
+            else:
+                # Try to auto-detect from PyTorch's build config
+                try:
+                    gpu_arch = torch.cuda.get_arch_list() if torch.cuda.is_available() else []
+                    hip_archs_from_torch = ";".join(
+                        a.replace("gfx", "gfx") for a in gpu_arch if a.startswith("gfx")
+                    )
+                    if hip_archs_from_torch:
+                        cmake_args.append(f"-DHIP_ARCHITECTURES={hip_archs_from_torch}")
+                except Exception:
+                    pass  # Fall through to CMake default
 
         self.build_temp = os.getenv("TORCHCODEC_CMAKE_BUILD_DIR", self.build_temp)
         print(f"Using {self.build_temp = }", flush=True)
