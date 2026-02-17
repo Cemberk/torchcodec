@@ -35,8 +35,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Defaults
 GPU_VENDOR=""
 HIP_ARCH=""
-ROCM_VERSION="6.3.1"
-PYTORCH_ROCM="rocm6.3"
+ROCM_VERSION="7.2-complete"
+PYTORCH_ROCM="rocm7.2"
 CUDA_VERSION="12.6.3"
 CODECS="h264"
 QUICK=""
@@ -67,8 +67,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --rocm              Force ROCm (AMD) build"
             echo "  --cuda              Force CUDA (NVIDIA) build"
             echo "  --arch ARCH         HIP architecture (e.g., gfx942 for MI300X)"
-            echo "  --rocm-version VER  ROCm version (default: 6.3.1)"
-            echo "  --pytorch-rocm VER  PyTorch ROCm wheel index (default: rocm6.3)"
+            echo "  --rocm-version VER  ROCm version (default: 7.2-complete)"
+            echo "  --pytorch-rocm VER  PyTorch ROCm wheel index (default: rocm7.2)"
             echo "  --cuda-version VER  CUDA version (default: 12.6.3)"
             echo "  --codecs LIST       Comma-separated codecs (default: h264)"
             echo "  --quick             Quick mode (fewer iterations)"
@@ -119,6 +119,7 @@ if [[ "$NO_DOCKER" == false ]]; then
 
         docker build -f docker/Dockerfile.rocm \
             "${BUILD_ARGS[@]}" \
+	    --no-cache \
             -t "$IMAGE_TAG" .
 
         echo "[*] Running benchmark in ROCm container..."

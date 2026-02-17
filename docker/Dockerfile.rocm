@@ -42,11 +42,11 @@
 #
 # =============================================================================
 
-ARG ROCM_VERSION=6.3.1
+ARG ROCM_VERSION=7.2-complete
 ARG UBUNTU_VERSION=24.04
 FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION}
 
-ARG PYTORCH_ROCM=rocm6.3
+ARG PYTORCH_ROCM=rocm7.2
 ARG HIP_ARCHITECTURES=""
 
 ENV DEBIAN_FRONTEND=noninteractive
