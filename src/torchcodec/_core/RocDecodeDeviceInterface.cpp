@@ -530,6 +530,58 @@ UniqueAVFrame RocDecodeDeviceInterface::convertRocDecFrameToAVFrame(
   TORCH_CHECK(
       pitch >= static_cast<uint32_t>(width), "Pitch must be >= width");
 
+  // Unlike NVDEC which has an explicit map/unmap pattern to lock decode
+  // surfaces, rocDecGetVideoFrame returns raw pointers into the decoder's
+  // internal surface pool. These surfaces can be recycled as soon as the
+  // next frame is decoded, so we must copy the NV12 data to owned memory
+  // before returning.
+  int yHeight = height;
+  int uvHeight = height / 2; // NV12: UV plane is half height
+  size_t ySize = static_cast<size_t>(pitch) * yHeight;
+  size_t uvSize = static_cast<size_t>(pitch) * uvHeight;
+  size_t totalSize = ySize + uvSize;
+
+  uint8_t* ownedBuffer = nullptr;
+  hipError_t err =
+      hipMalloc(reinterpret_cast<void**>(&ownedBuffer), totalSize);
+  TORCH_CHECK(
+      err == hipSuccess,
+      "Failed to allocate HIP memory for frame copy: ",
+      hipGetErrorString(err));
+
+  hipStream_t currentStream =
+      c10::hip::getCurrentHIPStream(device_.index()).stream();
+
+  // Copy Y plane from decoder surface to owned buffer
+  err = hipMemcpy2DAsync(
+      ownedBuffer,
+      pitch,
+      devMemPtr[0],
+      pitch,
+      width,
+      yHeight,
+      hipMemcpyDeviceToDevice,
+      currentStream);
+  TORCH_CHECK(
+      err == hipSuccess,
+      "Failed to copy Y plane: ",
+      hipGetErrorString(err));
+
+  // Copy UV plane from decoder surface to owned buffer
+  err = hipMemcpy2DAsync(
+      ownedBuffer + ySize,
+      pitch,
+      devMemPtr[1],
+      pitch,
+      width,
+      uvHeight,
+      hipMemcpyDeviceToDevice,
+      currentStream);
+  TORCH_CHECK(
+      err == hipSuccess,
+      "Failed to copy UV plane: ",
+      hipGetErrorString(err));
+
   UniqueAVFrame avFrame(av_frame_alloc());
   TORCH_CHECK(avFrame.get() != nullptr, "Failed to allocate AVFrame");
 
@@ -558,16 +610,26 @@ UniqueAVFrame RocDecodeDeviceInterface::convertRocDecFrameToAVFrame(
       ? AVCOL_RANGE_JPEG
       : AVCOL_RANGE_MPEG;
 
-  // rocDecGetVideoFrame returns per-plane pointers:
-  // devMemPtr[0] = Y plane, devMemPtr[1] = UV plane (for NV12)
-  avFrame->data[0] = reinterpret_cast<uint8_t*>(devMemPtr[0]);
-  avFrame->data[1] = reinterpret_cast<uint8_t*>(devMemPtr[1]);
+  // Point AVFrame at our owned copy of the NV12 data
+  avFrame->data[0] = ownedBuffer;
+  avFrame->data[1] = ownedBuffer + ySize;
   avFrame->data[2] = nullptr;
   avFrame->data[3] = nullptr;
   avFrame->linesize[0] = static_cast<int>(pitch);
   avFrame->linesize[1] = static_cast<int>(pitch);
   avFrame->linesize[2] = 0;
   avFrame->linesize[3] = 0;
+
+  // Register cleanup callback so HIP memory is freed when AVFrame is released
+  avFrame->opaque_ref = av_buffer_create(
+      nullptr,
+      0,
+      hipBufferFreeCallback,
+      ownedBuffer,
+      0);
+  TORCH_CHECK(
+      avFrame->opaque_ref != nullptr,
+      "Failed to create GPU memory cleanup reference");
 
   return avFrame;
 }

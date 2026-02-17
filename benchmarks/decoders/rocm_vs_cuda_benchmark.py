@@ -252,6 +252,12 @@ def get_video_info(video_path: str) -> dict:
     }
 
 
+def _gpu_sync():
+    """Synchronize GPU after decode operations to avoid async errors."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def bench_sequential_decode(
     video_path: str,
     device: str,
@@ -272,6 +278,7 @@ def bench_sequential_decode(
             count += 1
             if count >= num_frames:
                 break
+        _gpu_sync()
         return count
 
     t = benchmark.Timer(
@@ -304,6 +311,7 @@ def bench_full_video_decode(
         for frame in decoder:
             count += 1
         frame_count_holder[0] = count
+        _gpu_sync()
         return count
 
     # Warm up once to get frame count
@@ -341,7 +349,9 @@ def bench_random_seek_decode(
             seek_mode="exact",
             num_ffmpeg_threads=1 if device != "cpu" else 0,
         )
-        return decoder.get_frames_played_at(pts_list)
+        result = decoder.get_frames_played_at(pts_list)
+        _gpu_sync()
+        return result
 
     t = benchmark.Timer(
         stmt="_seek_decode()",
@@ -394,9 +404,14 @@ def bench_multithreaded_decode(
     device: str,
     num_videos: int = 10,
     num_threads: int = 4,
+    num_gpus: int = 1,
     min_run_time: float = 10.0,
 ) -> tuple[benchmark.Measurement, int]:
-    """Benchmark concurrent video decoding across threads."""
+    """Benchmark concurrent video decoding across threads.
+
+    When num_gpus > 1, distributes work across multiple GPUs to test
+    multi-GPU decode throughput.
+    """
     frame_count_holder = [0]
 
     def _decode_one(dev):
@@ -414,26 +429,27 @@ def bench_multithreaded_decode(
     def _decode_all():
         total = 0
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            device_count = torch.cuda.device_count()
             futures = []
             for i in range(num_videos):
-                dev = f"cuda:{i % device_count}" if device != "cpu" else "cpu"
+                dev = f"cuda:{i % num_gpus}" if device != "cpu" else "cpu"
                 futures.append(executor.submit(_decode_one, dev))
             for f in futures:
                 total += f.result()
         frame_count_holder[0] = total
+        _gpu_sync()
         return total
 
     # Warm up
     _decode_all()
     total_frames = frame_count_holder[0]
 
+    gpu_label = f"{num_gpus} GPU{'s' if num_gpus > 1 else ''}"
     t = benchmark.Timer(
         stmt="_decode_all()",
         globals={"_decode_all": _decode_all},
         label="multithreaded_decode",
         sub_label=f"device={device}",
-        description=f"{num_videos} videos x {num_threads} threads",
+        description=f"{num_videos} videos x {num_threads} threads x {gpu_label}",
     )
     return t.blocked_autorange(min_run_time=min_run_time), total_frames
 
@@ -522,6 +538,25 @@ def run_all_benchmarks(args) -> dict:
     all_results = []
     torch_results = []  # for Compare table
 
+    # Smoke test: verify GPU decode works before running full benchmarks
+    if torch.cuda.is_available():
+        first_video = next(iter(videos.values()))
+        print("Smoke test: decoding 1 frame on GPU...", end=" ", flush=True)
+        try:
+            test_decoder = VideoDecoder(
+                first_video,
+                device="cuda:0",
+                num_ffmpeg_threads=1,
+            )
+            test_frame = next(iter(test_decoder))
+            torch.cuda.synchronize()
+            del test_decoder
+            print(f"OK (shape={test_frame.data.shape})")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            print("GPU decode not working, will only run CPU benchmarks.")
+            devices = ["cpu"]
+
     for codec_label, video_path in videos.items():
         video_info = get_video_info(video_path)
         print(f"\n--- Video: {Path(video_path).name} ---")
@@ -538,42 +573,51 @@ def run_all_benchmarks(args) -> dict:
             # 1. Sequential decode (first N frames)
             num_seq = min(200, video_info["num_frames"])
             print(f"    Sequential decode ({num_seq} frames)...", end=" ", flush=True)
-            m = bench_sequential_decode(video_path, device, num_seq, min_run_time=min_run_time)
-            torch_results.append(m)
-            r = measurement_to_result(
-                m, "sequential_decode", codec_label, video_path,
-                video_info, num_seq, device, gpu_info,
-                seek_mode="approximate",
-            )
-            all_results.append(r)
-            print(f"{r.decode_fps_median:.1f} FPS (median)")
+            try:
+                m = bench_sequential_decode(video_path, device, num_seq, min_run_time=min_run_time)
+                torch_results.append(m)
+                r = measurement_to_result(
+                    m, "sequential_decode", codec_label, video_path,
+                    video_info, num_seq, device, gpu_info,
+                    seek_mode="approximate",
+                )
+                all_results.append(r)
+                print(f"{r.decode_fps_median:.1f} FPS (median)")
+            except Exception as e:
+                print(f"FAILED ({e})")
 
             # 2. Full video decode
             print(f"    Full video decode...", end=" ", flush=True)
-            m, frame_count = bench_full_video_decode(
-                video_path, device, min_run_time=min_run_time
-            )
-            torch_results.append(m)
-            r = measurement_to_result(
-                m, "full_video_decode", codec_label, video_path,
-                video_info, frame_count, device, gpu_info,
-                seek_mode="approximate",
-            )
-            all_results.append(r)
-            print(f"{r.decode_fps_median:.1f} FPS (median), {frame_count} frames")
+            try:
+                m, frame_count = bench_full_video_decode(
+                    video_path, device, min_run_time=min_run_time
+                )
+                torch_results.append(m)
+                r = measurement_to_result(
+                    m, "full_video_decode", codec_label, video_path,
+                    video_info, frame_count, device, gpu_info,
+                    seek_mode="approximate",
+                )
+                all_results.append(r)
+                print(f"{r.decode_fps_median:.1f} FPS (median), {frame_count} frames")
+            except Exception as e:
+                print(f"FAILED ({e})")
 
             # 3. Random seek + decode
             num_seeks = 20 if args.quick else 50
             print(f"    Random seek+decode ({num_seeks} seeks)...", end=" ", flush=True)
-            m = bench_random_seek_decode(video_path, device, num_seeks, min_run_time=min_run_time)
-            torch_results.append(m)
-            r = measurement_to_result(
-                m, "random_seek_decode", codec_label, video_path,
-                video_info, num_seeks, device, gpu_info,
-                seek_mode="exact",
-            )
-            all_results.append(r)
-            print(f"{r.decode_fps_median:.1f} FPS (median)")
+            try:
+                m = bench_random_seek_decode(video_path, device, num_seeks, min_run_time=min_run_time)
+                torch_results.append(m)
+                r = measurement_to_result(
+                    m, "random_seek_decode", codec_label, video_path,
+                    video_info, num_seeks, device, gpu_info,
+                    seek_mode="exact",
+                )
+                all_results.append(r)
+                print(f"{r.decode_fps_median:.1f} FPS (median)")
+            except Exception as e:
+                print(f"FAILED ({e})")
 
             # 4. Decode + resize (training-like pipeline)
             num_resize = min(100, video_info["num_frames"])
@@ -595,20 +639,48 @@ def run_all_benchmarks(args) -> dict:
 
             # 5. Multi-threaded decode (GPU only)
             if device != "cpu" and args.threads > 1:
+                device_count = torch.cuda.device_count()
                 num_vids = args.threads * 2
-                print(f"    Multi-threaded decode ({num_vids} videos, {args.threads} threads)...", end=" ", flush=True)
-                m, total_frames = bench_multithreaded_decode(
-                    video_path, device, num_vids, args.threads,
-                    min_run_time=min_run_time,
-                )
-                torch_results.append(m)
-                r = measurement_to_result(
-                    m, "multithreaded_decode", codec_label, video_path,
-                    video_info, total_frames, device, gpu_info,
-                    num_threads=args.threads,
-                )
-                all_results.append(r)
-                print(f"{r.decode_fps_median:.1f} FPS (median)")
+
+                # Single-GPU multi-threaded
+                print(f"    Multi-threaded decode ({num_vids} videos, {args.threads} threads, 1 GPU)...", end=" ", flush=True)
+                try:
+                    m, total_frames = bench_multithreaded_decode(
+                        video_path, device, num_vids, args.threads,
+                        num_gpus=1,
+                        min_run_time=min_run_time,
+                    )
+                    torch_results.append(m)
+                    r = measurement_to_result(
+                        m, "multithreaded_1gpu", codec_label, video_path,
+                        video_info, total_frames, device, gpu_info,
+                        num_threads=args.threads,
+                    )
+                    all_results.append(r)
+                    print(f"{r.decode_fps_median:.1f} FPS (median)")
+                except Exception as e:
+                    print(f"FAILED ({e})")
+
+                # Multi-GPU multi-threaded (if more than 1 GPU available)
+                if device_count >= 2:
+                    num_gpus = min(device_count, args.threads)
+                    print(f"    Multi-threaded decode ({num_vids} videos, {args.threads} threads, {num_gpus} GPUs)...", end=" ", flush=True)
+                    try:
+                        m, total_frames = bench_multithreaded_decode(
+                            video_path, device, num_vids, args.threads,
+                            num_gpus=num_gpus,
+                            min_run_time=min_run_time,
+                        )
+                        torch_results.append(m)
+                        r = measurement_to_result(
+                            m, f"multithreaded_{num_gpus}gpu", codec_label, video_path,
+                            video_info, total_frames, device, gpu_info,
+                            num_threads=args.threads,
+                        )
+                        all_results.append(r)
+                        print(f"{r.decode_fps_median:.1f} FPS (median)")
+                    except Exception as e:
+                        print(f"FAILED ({e})")
 
     # Print comparison table
     if torch_results:
