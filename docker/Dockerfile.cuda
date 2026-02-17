@@ -102,6 +102,7 @@ WORKDIR /build/torchcodec
 COPY . .
 
 ENV ENABLE_CUDA=1
+ENV I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1
 RUN pip install --no-cache-dir . --no-build-isolation
 
 # Copy benchmarks and test resources before cleaning build dir

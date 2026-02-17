@@ -35,8 +35,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Defaults
 GPU_VENDOR=""
 HIP_ARCH=""
-ROCM_VERSION="7.2-complete"
-PYTORCH_ROCM="rocm7.2"
+PYTORCH_ROCM_IMAGE="rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.8.0"
 CUDA_VERSION="12.6.3"
 CODECS="h264"
 QUICK=""
@@ -51,8 +50,7 @@ while [[ $# -gt 0 ]]; do
         --rocm)       GPU_VENDOR="AMD";    shift ;;
         --cuda)       GPU_VENDOR="NVIDIA"; shift ;;
         --arch)       HIP_ARCH="$2";       shift 2 ;;
-        --rocm-version) ROCM_VERSION="$2"; shift 2 ;;
-        --pytorch-rocm) PYTORCH_ROCM="$2"; shift 2 ;;
+        --rocm-image) PYTORCH_ROCM_IMAGE="$2"; shift 2 ;;
         --cuda-version) CUDA_VERSION="$2"; shift 2 ;;
         --codecs)     CODECS="$2";         shift 2 ;;
         --quick)      QUICK="--quick";     shift ;;
@@ -67,8 +65,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --rocm              Force ROCm (AMD) build"
             echo "  --cuda              Force CUDA (NVIDIA) build"
             echo "  --arch ARCH         HIP architecture (e.g., gfx942 for MI300X)"
-            echo "  --rocm-version VER  ROCm version (default: 7.2-complete)"
-            echo "  --pytorch-rocm VER  PyTorch ROCm wheel index (default: rocm7.2)"
+            echo "  --rocm-image IMAGE  rocm/pytorch base image tag"
+            echo "                      (default: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.8.0)"
             echo "  --cuda-version VER  CUDA version (default: 12.6.3)"
             echo "  --codecs LIST       Comma-separated codecs (default: h264)"
             echo "  --quick             Quick mode (fewer iterations)"
@@ -106,12 +104,13 @@ if [[ "$NO_DOCKER" == false ]]; then
     cd "$REPO_ROOT"
 
     if [[ "$GPU_VENDOR" == "AMD" ]]; then
-        IMAGE_TAG="torchcodec-bench:rocm${ROCM_VERSION}"
+        # Derive a short tag from the image name for the local build
+        IMAGE_TAG="torchcodec-bench:$(echo "$PYTORCH_ROCM_IMAGE" | sed 's|rocm/pytorch:||; s|_|-|g')"
         echo "[*] Building ROCm image: $IMAGE_TAG"
+        echo "[*] Base image: $PYTORCH_ROCM_IMAGE"
 
         BUILD_ARGS=(
-            --build-arg "ROCM_VERSION=${ROCM_VERSION}"
-            --build-arg "PYTORCH_ROCM=${PYTORCH_ROCM}"
+            --build-arg "PYTORCH_ROCM_IMAGE=${PYTORCH_ROCM_IMAGE}"
         )
         if [[ -n "$HIP_ARCH" ]]; then
             BUILD_ARGS+=(--build-arg "HIP_ARCHITECTURES=${HIP_ARCH}")
@@ -119,7 +118,6 @@ if [[ "$NO_DOCKER" == false ]]; then
 
         docker build -f docker/Dockerfile.rocm \
             "${BUILD_ARGS[@]}" \
-	    --no-cache \
             -t "$IMAGE_TAG" .
 
         echo "[*] Running benchmark in ROCm container..."
