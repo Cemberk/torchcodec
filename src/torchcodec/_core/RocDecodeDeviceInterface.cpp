@@ -130,8 +130,13 @@ bool nativeRocDecSupport(
     return false;
   }
 
+  // Ensure rocDecode queries the correct GPU
+  int deviceIndex = getDeviceIndex_HIP(device);
+  hipSetDevice(deviceIndex);
+
   // Query decoder capabilities
   RocdecDecodeCaps caps = {};
+  caps.device_id = static_cast<uint8_t>(deviceIndex);
   caps.codec_type = codecType.value();
   caps.chroma_format = chromaFormat.value();
   caps.bit_depth_minus_8 = static_cast<uint32_t>(desc->comp[0].depth - 8);
@@ -180,6 +185,19 @@ RocDecodeDeviceInterface::RocDecodeDeviceInterface(const torch::Device& device)
       device_.type() == torch::kCUDA, "Unsupported device: ", device_.str());
 
   initializeHIPContextWithPytorch(device_);
+
+  // Explicitly set the HIP device so the rocDecode library (loaded via
+  // dlopen) uses the same GPU as PyTorch. Without this, rocDecode may
+  // open a DRM fd to a different GPU, causing memory access faults in
+  // multi-GPU environments.
+  int deviceIndex = getDeviceIndex_HIP(device_);
+  hipError_t hipErr = hipSetDevice(deviceIndex);
+  TORCH_CHECK(
+      hipErr == hipSuccess,
+      "Failed to set HIP device ",
+      deviceIndex,
+      ": ",
+      hipGetErrorString(hipErr));
 
   rocDecodeAvailable_ = loadRocDecodeLibrary();
 }
@@ -329,26 +347,22 @@ void RocDecodeDeviceInterface::initializeBSF(
 UniqueRocDecoder RocDecodeDeviceInterface::createDecoder(
     RocdecVideoFormat* videoFormat,
     int deviceId) {
+  // Set HIP device before creating the decoder to ensure rocDecode
+  // uses the same GPU context as PyTorch/HIP.
+  hipSetDevice(deviceId);
+
   RocDecoderCreateInfo decoderParams = {};
-  decoderParams.codec_type = static_cast<uint32_t>(videoFormat->codec);
-  decoderParams.chroma_format =
-      static_cast<uint32_t>(videoFormat->chroma_format);
-  decoderParams.bit_depth_minus_8 = videoFormat->bit_depth_luma_minus8;
-  // Request NV12 output - same as NVDEC path. 10bit videos will be
-  // automatically converted to 8bit by the VCN hardware.
-  decoderParams.output_format =
-      static_cast<uint32_t>(rocDecVideoSurfaceFormat_NV12);
-  decoderParams.internal_decode_flag = 0;
+  // device_id is the FIRST field in the real v1.5.0 struct (uint8_t)
+  decoderParams.device_id = static_cast<uint8_t>(deviceId);
   decoderParams.width = videoFormat->coded_width;
   decoderParams.height = videoFormat->coded_height;
+  decoderParams.num_decode_surfaces = videoFormat->min_num_decode_surfaces;
+  decoderParams.codec_type = videoFormat->codec;
+  decoderParams.chroma_format = videoFormat->chroma_format;
+  decoderParams.bit_depth_minus_8 = videoFormat->bit_depth_luma_minus8;
+  decoderParams.intra_decode_only = 0;
   decoderParams.max_width = videoFormat->coded_width;
   decoderParams.max_height = videoFormat->coded_height;
-  decoderParams.num_decode_surfaces = videoFormat->min_num_decode_surfaces;
-  decoderParams.num_output_surfaces = 1;
-  decoderParams.target_width = static_cast<uint32_t>(
-      videoFormat->display_area.right - videoFormat->display_area.left);
-  decoderParams.target_height = static_cast<uint32_t>(
-      videoFormat->display_area.bottom - videoFormat->display_area.top);
   decoderParams.display_rect.left =
       static_cast<int16_t>(videoFormat->display_area.left);
   decoderParams.display_rect.top =
@@ -357,7 +371,14 @@ UniqueRocDecoder RocDecodeDeviceInterface::createDecoder(
       static_cast<int16_t>(videoFormat->display_area.right);
   decoderParams.display_rect.bottom =
       static_cast<int16_t>(videoFormat->display_area.bottom);
-  decoderParams.device_id = deviceId;
+  // Request NV12 output - same as NVDEC path. 10bit videos will be
+  // automatically converted to 8bit by the VCN hardware.
+  decoderParams.output_format = rocDecVideoSurfaceFormat_NV12;
+  decoderParams.target_width = static_cast<uint32_t>(
+      videoFormat->display_area.right - videoFormat->display_area.left);
+  decoderParams.target_height = static_cast<uint32_t>(
+      videoFormat->display_area.bottom - videoFormat->display_area.top);
+  decoderParams.num_output_surfaces = 1;
 
   rocDecDecoderHandle* decoderHandle = new rocDecDecoderHandle();
   rocDecStatus result = rocDecCreateDecoder(decoderHandle, &decoderParams);
@@ -491,16 +512,15 @@ int RocDecodeDeviceInterface::receiveFrame(UniqueAVFrame& avFrame) {
   RocdecParserDispInfo dispInfo = readyFrames_.front();
   readyFrames_.pop();
 
+  // Ensure the correct HIP device is active before calling rocDecode APIs
+  hipSetDevice(getDeviceIndex_HIP(device_));
+
   // rocDecGetVideoFrame is a blocking call that returns per-plane device
   // pointers. Unlike NVDEC's map/unmap pattern, rocDecode gives us direct
   // pointers to the decoded frame data.
   RocdecProcParams procParams = {};
   procParams.progressive_frame = dispInfo.progressive_frame;
   procParams.top_field_first = dispInfo.top_field_first;
-  procParams.unpaired_field = dispInfo.repeat_first_field < 0 ? 1 : 0;
-  // Set output stream for synchronization
-  procParams.output_stream = reinterpret_cast<void*>(
-      c10::hip::getCurrentHIPStream(device_.index()).stream());
 
   void* devMemPtr[3] = {nullptr, nullptr, nullptr};
   uint32_t pitch = 0;
