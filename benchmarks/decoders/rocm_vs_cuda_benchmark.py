@@ -202,7 +202,7 @@ def detect_gpu() -> GPUInfo:
         vendor=vendor,
         name=props.name,
         architecture=arch,
-        vram_mb=props.total_mem // (1024 * 1024),
+        vram_mb=getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) // (1024 * 1024),
         driver_version=driver,
         runtime_version=runtime_version,
         device_count=device_count,

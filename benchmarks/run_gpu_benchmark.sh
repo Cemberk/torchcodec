@@ -103,22 +103,25 @@ mkdir -p "$OUTPUT_DIR"
 if [[ "$NO_DOCKER" == false ]]; then
     cd "$REPO_ROOT"
 
+    # Dockerfiles clone from git — no build context needed.
+    # Pipe an empty context to avoid sending the whole repo.
     if [[ "$GPU_VENDOR" == "AMD" ]]; then
-        # Derive a short tag from the image name for the local build
         IMAGE_TAG="torchcodec-bench:$(echo "$PYTORCH_ROCM_IMAGE" | sed 's|rocm/pytorch:||; s|_|-|g')"
         echo "[*] Building ROCm image: $IMAGE_TAG"
         echo "[*] Base image: $PYTORCH_ROCM_IMAGE"
 
         BUILD_ARGS=(
             --build-arg "PYTORCH_ROCM_IMAGE=${PYTORCH_ROCM_IMAGE}"
+            --build-arg "CACHEBUST=$(date +%s)"
         )
         if [[ -n "$HIP_ARCH" ]]; then
             BUILD_ARGS+=(--build-arg "HIP_ARCHITECTURES=${HIP_ARCH}")
         fi
 
-        docker build -f docker/Dockerfile.rocm \
+        docker build \
             "${BUILD_ARGS[@]}" \
-            -t "$IMAGE_TAG" .
+            -t "$IMAGE_TAG" \
+            - < "$REPO_ROOT/docker/Dockerfile.rocm"
 
         echo "[*] Running benchmark in ROCm container..."
         docker run --rm \
@@ -136,9 +139,11 @@ if [[ "$NO_DOCKER" == false ]]; then
         IMAGE_TAG="torchcodec-bench:cuda${CUDA_VERSION}"
         echo "[*] Building CUDA image: $IMAGE_TAG"
 
-        docker build -f docker/Dockerfile.cuda \
+        docker build \
             --build-arg "CUDA_VERSION=${CUDA_VERSION}" \
-            -t "$IMAGE_TAG" .
+            --build-arg "CACHEBUST=$(date +%s)" \
+            -t "$IMAGE_TAG" \
+            - < "$REPO_ROOT/docker/Dockerfile.cuda"
 
         echo "[*] Running benchmark in CUDA container..."
         docker run --rm \

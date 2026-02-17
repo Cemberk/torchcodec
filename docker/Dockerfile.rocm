@@ -10,6 +10,8 @@
 # Build args:
 #   PYTORCH_ROCM_IMAGE - Full rocm/pytorch image tag (default below)
 #   HIP_ARCHITECTURES  - Semicolon-separated GPU targets (default: broad list)
+#   TORCHCODEC_REPO    - Git repo URL to clone (default: Cemberk fork)
+#   TORCHCODEC_BRANCH  - Git branch to build (default: main)
 #
 # Examples:
 #   # ROCm 7.2 / PyTorch 2.8 on MI300X
@@ -29,13 +31,15 @@
 #     --group-add video \
 #     torchcodec:rocm7.2 python3 -c "import torchcodec; print('OK')"
 #
-# Available images: https://hub.docker.com/r/rocm/pytorch/tags
+# Available base images: https://hub.docker.com/r/rocm/pytorch/tags
 # =============================================================================
 
 ARG PYTORCH_ROCM_IMAGE=rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
 FROM ${PYTORCH_ROCM_IMAGE}
 
 ARG HIP_ARCHITECTURES=""
+ARG TORCHCODEC_REPO=https://github.com/Cemberk/torchcodec.git
+ARG TORCHCODEC_BRANCH=main
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -77,34 +81,37 @@ RUN apt-get update && \
 RUN pip install --no-cache-dir pybind11 numpy
 
 # =============================================================================
-# 4. Build and install TorchCodec
+# 4. Clone and build TorchCodec
 # =============================================================================
+# ARG before RUN busts Docker cache when CACHEBUST value changes.
+ARG CACHEBUST=1
+RUN git clone --depth 1 --branch ${TORCHCODEC_BRANCH} ${TORCHCODEC_REPO} /build/torchcodec
 WORKDIR /build/torchcodec
-COPY . .
 
 # ENABLE_ROCM: auto-detected from torch.version.hip, but set explicitly
 #              for clarity in build logs.
-# HIP_ARCHITECTURES: when non-empty, passed to CMake to limit GPU targets.
-#                    When empty, CMake defaults to a broad multi-arch build.
-# --no-build-isolation: lets setup.py see the base image's torch headers.
+# TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR: PyTorch's ROCm cmake config
+#              injects Clang-only flags (e.g. -Wno-duplicate-decl-specifier)
+#              that GCC rejects under -Werror.
 ENV ENABLE_ROCM=ON
 ENV I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1
-# pybind11's cmake config lives under its Python package; tell CMake where.
+ENV TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR=ON
 RUN if [ -n "${HIP_ARCHITECTURES}" ]; then \
         export HIP_ARCHITECTURES="${HIP_ARCHITECTURES}"; \
     fi && \
     export pybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')" && \
     pip install --no-cache-dir . --no-build-isolation
 
-# Copy benchmarks and test resources before cleaning build dir
-RUN cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
-    cp -r /build/torchcodec/test/resources /workspace/test_resources
-
-# Clean up build directory to save image space
-RUN rm -rf /build
+# =============================================================================
+# 5. Stage benchmarks and test resources, then clean up
+# =============================================================================
+RUN mkdir -p /workspace && \
+    cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
+    cp -r /build/torchcodec/test/resources /workspace/test_resources && \
+    rm -rf /build
 
 # =============================================================================
-# 5. Smoke test
+# 6. Smoke test
 # =============================================================================
 RUN python3 -c "\
 import torchcodec; \
@@ -114,7 +121,7 @@ print(f'torch {torch.__version__} (HIP: {torch.version.hip})'); \
 "
 
 # =============================================================================
-# 6. Default entrypoint
+# 7. Default entrypoint
 # =============================================================================
 WORKDIR /workspace
 CMD ["python3"]

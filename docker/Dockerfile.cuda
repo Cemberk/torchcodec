@@ -7,8 +7,10 @@
 # GPU benchmarking.
 #
 # Build args:
-#   CUDA_VERSION     - CUDA version for base image (default: 12.6.3)
-#   UBUNTU_VERSION   - Ubuntu version (default: 22.04)
+#   CUDA_VERSION       - CUDA version for base image (default: 12.6.3)
+#   UBUNTU_VERSION     - Ubuntu version (default: 22.04)
+#   TORCHCODEC_REPO    - Git repo URL to clone (default: Cemberk fork)
+#   TORCHCODEC_BRANCH  - Git branch to build (default: main)
 #
 # Examples:
 #   # CUDA 12.6
@@ -31,6 +33,9 @@ ARG CUDA_VERSION=12.6.3
 ARG UBUNTU_VERSION=22.04
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 
+ARG TORCHCODEC_REPO=https://github.com/Cemberk/torchcodec.git
+ARG TORCHCODEC_BRANCH=main
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # =============================================================================
@@ -52,67 +57,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-dev \
         python3-pip \
         python3-venv \
-        wget \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
-# 2. NVIDIA Video Codec SDK headers (for NVDEC hardware decoding)
-# =============================================================================
-# The CUDA devel image includes the toolkit but not the Video Codec SDK
-# headers. These are required for NVDEC-based hardware video decoding.
-# The headers are typically installed via libnpp or available in the
-# conda environment in CI. For Docker builds, they come with the
-# cuda-devel base image's nvdec support.
-# If nv-codec-headers are needed, uncomment below:
-# RUN git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git /tmp/nv-codec-headers && \
-#     cd /tmp/nv-codec-headers && make install && rm -rf /tmp/nv-codec-headers
-
-# =============================================================================
-# 3. Python virtual environment
+# 2. Python virtual environment
 # =============================================================================
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # =============================================================================
-# 4. PyTorch + ecosystem (CUDA wheels)
+# 3. PyTorch + ecosystem (CUDA wheels)
 # =============================================================================
-# Install PyTorch with matching CUDA version.
-# The CUDA minor version in the wheel index must match the base image.
-#
-# | Base image CUDA | Wheel index   |
-# |-----------------|---------------|
-# | 12.6.x          | cu126         |
-# | 12.8.x          | cu128         |
-# | 13.0.x          | cu130         |
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir \
         torch torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu126
 
 # =============================================================================
-# 5. TorchCodec build-time Python dependencies
+# 4. TorchCodec build-time Python dependencies
 # =============================================================================
 RUN pip install --no-cache-dir pybind11 numpy
 
 # =============================================================================
-# 6. Build and install TorchCodec
+# 5. Clone and build TorchCodec
 # =============================================================================
+# ARG before RUN busts Docker cache when CACHEBUST value changes.
+ARG CACHEBUST=1
+RUN git clone --depth 1 --branch ${TORCHCODEC_BRANCH} ${TORCHCODEC_REPO} /build/torchcodec
 WORKDIR /build/torchcodec
-COPY . .
 
 ENV ENABLE_CUDA=1
 ENV I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1
-# pybind11's cmake config lives under its Python package; tell CMake where.
 RUN export pybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')" && \
     pip install --no-cache-dir . --no-build-isolation
 
-# Copy benchmarks and test resources before cleaning build dir
-RUN cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
-    cp -r /build/torchcodec/test/resources /workspace/test_resources
-
-# Clean up build directory to save image space
-RUN rm -rf /build
+# =============================================================================
+# 6. Stage benchmarks and test resources, then clean up
+# =============================================================================
+RUN mkdir -p /workspace && \
+    cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
+    cp -r /build/torchcodec/test/resources /workspace/test_resources && \
+    rm -rf /build
 
 # =============================================================================
 # 7. Smoke test
