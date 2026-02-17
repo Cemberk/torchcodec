@@ -144,6 +144,10 @@ RUN if [ -n "${HIP_ARCHITECTURES}" ]; then \
     fi && \
     pip install --no-cache-dir . --no-build-isolation
 
+# Copy benchmarks and test resources before cleaning build dir
+RUN cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
+    cp -r /build/torchcodec/test/resources /workspace/test_resources
+
 # Clean up build directory to save image space
 RUN rm -rf /build
 

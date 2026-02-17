@@ -1,0 +1,128 @@
+# =============================================================================
+# TorchCodec CUDA Dockerfile
+# =============================================================================
+#
+# Builds torchcodec with hardware-accelerated video decoding via NVDEC
+# on NVIDIA GPUs. Companion to Dockerfile.rocm for cross-platform
+# GPU benchmarking.
+#
+# Build args:
+#   CUDA_VERSION     - CUDA version for base image (default: 12.6.3)
+#   UBUNTU_VERSION   - Ubuntu version (default: 22.04)
+#
+# Examples:
+#   # CUDA 12.6
+#   docker build -f docker/Dockerfile.cuda \
+#     -t torchcodec:cuda12.6 .
+#
+#   # CUDA 13.0
+#   docker build -f docker/Dockerfile.cuda \
+#     --build-arg CUDA_VERSION=13.0.0 \
+#     -t torchcodec:cuda13.0 .
+#
+# Run (requires NVIDIA GPU + nvidia-container-toolkit):
+#   docker run --rm -it --gpus all \
+#     -e NVIDIA_DRIVER_CAPABILITIES=video,compute,utility \
+#     torchcodec:cuda12.6 python3 -c "import torchcodec; print('OK')"
+#
+# =============================================================================
+
+ARG CUDA_VERSION=12.6.3
+ARG UBUNTU_VERSION=22.04
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# 1. System packages
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libavdevice-dev \
+        libavfilter-dev \
+        libswscale-dev \
+        libswresample-dev \
+        pkg-config \
+        cmake \
+        ninja-build \
+        g++ \
+        git \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# 2. NVIDIA Video Codec SDK headers (for NVDEC hardware decoding)
+# =============================================================================
+# The CUDA devel image includes the toolkit but not the Video Codec SDK
+# headers. These are required for NVDEC-based hardware video decoding.
+# The headers are typically installed via libnpp or available in the
+# conda environment in CI. For Docker builds, they come with the
+# cuda-devel base image's nvdec support.
+# If nv-codec-headers are needed, uncomment below:
+# RUN git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git /tmp/nv-codec-headers && \
+#     cd /tmp/nv-codec-headers && make install && rm -rf /tmp/nv-codec-headers
+
+# =============================================================================
+# 3. Python virtual environment
+# =============================================================================
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# =============================================================================
+# 4. PyTorch + ecosystem (CUDA wheels)
+# =============================================================================
+# Install PyTorch with matching CUDA version.
+# The CUDA minor version in the wheel index must match the base image.
+#
+# | Base image CUDA | Wheel index   |
+# |-----------------|---------------|
+# | 12.6.x          | cu126         |
+# | 12.8.x          | cu128         |
+# | 13.0.x          | cu130         |
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+        torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu126
+
+# =============================================================================
+# 5. TorchCodec build-time Python dependencies
+# =============================================================================
+RUN pip install --no-cache-dir pybind11 numpy
+
+# =============================================================================
+# 6. Build and install TorchCodec
+# =============================================================================
+WORKDIR /build/torchcodec
+COPY . .
+
+ENV ENABLE_CUDA=1
+RUN pip install --no-cache-dir . --no-build-isolation
+
+# Copy benchmarks and test resources before cleaning build dir
+RUN cp -r /build/torchcodec/benchmarks /workspace/benchmarks && \
+    cp -r /build/torchcodec/test/resources /workspace/test_resources
+
+# Clean up build directory to save image space
+RUN rm -rf /build
+
+# =============================================================================
+# 7. Smoke test
+# =============================================================================
+RUN python3 -c "\
+import torchcodec; \
+print(f'torchcodec {torchcodec.__version__} installed successfully'); \
+import torch; \
+print(f'torch {torch.__version__} (CUDA: {torch.version.cuda})'); \
+"
+
+# =============================================================================
+# 8. Default entrypoint
+# =============================================================================
+WORKDIR /workspace
+CMD ["python3"]
